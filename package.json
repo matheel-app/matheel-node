@@ -1,0 +1,56 @@
+{
+  "name": "matheel",
+  "version": "0.1.1",
+  "description": "Official client for the Matheel ZATCA Phase 2 e-invoicing API (Saudi Arabia, Fatoora): file invoices with a device token, decode the QR, verify callbacks.",
+  "keywords": [
+    "zatca",
+    "fatoora",
+    "e-invoicing",
+    "saudi",
+    "vat",
+    "einvoice"
+  ],
+  "homepage": "https://matheel.app/en/zatca-integration/nodejs",
+  "license": "MIT",
+  "author": "Matheel (https://matheel.app)",
+  "type": "commonjs",
+  "main": "./index.cjs",
+  "module": "./index.mjs",
+  "types": "./index.d.cts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./index.d.mts",
+        "default": "./index.mjs"
+      },
+      "require": {
+        "types": "./index.d.cts",
+        "default": "./index.cjs"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.cjs",
+    "index.mjs",
+    "index.d.cts",
+    "index.d.mts",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "sideEffects": false,
+  "scripts": {
+    "test": "node --test test/"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/matheel-app/matheel-node.git"
+  },
+  "bugs": {
+    "url": "https://github.com/matheel-app/matheel-node/issues"
+  }
+}
