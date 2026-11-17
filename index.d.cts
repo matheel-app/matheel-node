@@ -16,6 +16,9 @@ export interface InvoiceResult {
   pdf?: string | null;
   warnings: unknown[];
   errors: unknown[];
+  issued_at?: string;
+  /** True when an already-accepted document's stored answer is replayed (a resend of the same invoice.uuid). */
+  replayed?: boolean;
   [field: string]: unknown;
 }
 
@@ -44,21 +47,30 @@ export interface QrData {
 
 /** Client options. */
 export interface MatheelOptions {
-  /** A fetch implementation (default: the global fetch). */
+  /** A fetch implementation (default: node:https with a classic X25519 TLS key share). */
   fetch?: typeof fetch;
   /** Per-call timeout in milliseconds (default 60000). */
   timeoutMs?: number;
 }
 
-/** An API answer other than 200. */
+/** An API answer other than 200, or status 0 / code "network_error" when the network failed. */
 export declare class MatheelError extends Error {
-  /** Builds the error from the HTTP status and the parsed body. */
-  constructor(status: number, body: any);
+  /** Builds the error from the HTTP status, the parsed body and the Retry-After seconds. */
+  constructor(status: number, body: any, retryAfter?: number | null);
+  /** The HTTP status; 0 for a network failure, 502 for an answer that is not the API's JSON ("invalid_response"). */
   status: number;
   body: any;
   /** body.error (string or .code), else "zatca_rejected" when ZATCA's errors are present, else "http_<status>". */
   code: string;
+  /** The Retry-After header in seconds, when sent (409 filing_in_progress sends 5). */
+  retryAfter: number | null;
 }
+
+/** What to do with an error: resend the same request later, fix the document, or have a person look. */
+export type ErrorClass = "retry" | "permanent" | "attention";
+
+/** Classifies an error per the API contract; anything that is not a MatheelError is "attention". */
+export declare function classify(error: unknown): ErrorClass;
 
 /** A client for the Matheel API; the key is optional on the sandbox. */
 export declare class Matheel {
@@ -74,8 +86,14 @@ export declare class Matheel {
     environment?: "sandbox" | "simulation" | "production";
     [field: string]: unknown;
   }): Promise<InvoiceResult>;
-  /** Files with the token in `store`; 200 writes the new token, 409 device_token_reused re-reads and retries. */
-  fileWithStore(store: TokenStore, invoice: Invoice, options?: { pdf?: boolean; retries?: number; [field: string]: unknown }): Promise<InvoiceResult>;
+  /** Files with the token in `store`; 200 writes the next token, 409 device_token_reused stores the latest and resends, filing_in_progress waits and resends. */
+  fileWithStore(
+    store: TokenStore,
+    invoice: Invoice,
+    options?: { pdf?: boolean; retries?: number; /** Put into an invoice without one: a UUID v4 stored once per document. */ uuid?: string; [field: string]: unknown },
+  ): Promise<InvoiceResult>;
+  /** Sleeps between fileWithStore retries; replace it in tests. */
+  wait(ms: number): Promise<void>;
   /** Registers a device (POST /api/v1/onboarding). */
   onboard(request: {
     environment: "sandbox" | "simulation" | "production";

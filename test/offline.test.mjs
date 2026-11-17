@@ -2,7 +2,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash, createHmac } from "node:crypto";
-import { Matheel, MatheelError, decodeQr, verifyActivationCallback, verifyTelr } from "../index.mjs";
+import { Matheel, MatheelError, classify, decodeQr, verifyActivationCallback, verifyTelr } from "../index.mjs";
 import cjs from "../index.cjs";
 
 /** One TLV field, with a BER long-form length when the value exceeds 127 bytes. */
@@ -71,12 +71,13 @@ test("verifyTelr checks tran_check with and without tran_order", () => {
   assert.equal(verifyTelr({ ...f }, "secret"), false);
 });
 
-/** A fetch that answers from a queue of [status, body] and records each request body. */
+/** A fetch that answers from a queue of [status, body, headers?] (a string body is sent raw) and records each request. */
 function mockFetch(answers, calls) {
   return async (url, init) => {
     calls.push({ url, body: JSON.parse(init.body), auth: init.headers.Authorization });
-    const [status, body] = answers.shift();
-    return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+    const [status, body, headers = {}] = answers.shift();
+    const text = typeof body === "string" ? body : JSON.stringify(body);
+    return new Response(text, { status, headers: { "content-type": "application/json", ...headers } });
   };
 }
 
@@ -146,4 +147,107 @@ test("onboard and activationLink send the documented bodies", async () => {
 test("error codes come from a string error", async () => {
   const fetch = mockFetch([[429, { error: "sandbox_rate_limited" }]], []);
   await assert.rejects(new Matheel(null, undefined, { fetch }).fileInvoice({ invoice: {} }), { code: "sandbox_rate_limited", status: 429 });
+});
+
+test("fileWithStore: 409 with latest_device_token stores it and resends with it; uuid fills an invoice without one", async () => {
+  const calls = [];
+  const fetch = mockFetch([
+    [409, { error: { code: "device_token_reused", latest_device_token: "mdt1.latest", latest_counter: 7 } }],
+    [200, { status: "reported", device_token: "mdt1.next", counter: 8 }],
+  ], calls);
+  const store = memoryStore("mdt1.old");
+  const uuid = "3cf5ee18-ee25-44ea-a444-2c37ba7f28be";
+  const res = await new Matheel(null, undefined, { fetch }).fileWithStore(store, { type: "simplified" }, { uuid });
+  assert.equal(res.counter, 8);
+  assert.deepEqual(store.writes, ["mdt1.latest", "mdt1.next"]);
+  assert.deepEqual(calls.map((c) => c.body.device_token), ["mdt1.old", "mdt1.latest"]);
+  assert.deepEqual(calls.map((c) => c.body.invoice.uuid), [uuid, uuid]);
+  const own = await new Matheel(null, undefined, { fetch: mockFetch([[200, { device_token: "t" }]], calls) })
+    .fileWithStore(memoryStore("x"), { uuid: "own" }, { uuid });
+  assert.equal(own.device_token, "t");
+  assert.equal(calls[2].body.invoice.uuid, "own");
+});
+
+test("fileWithStore: 409 filing_in_progress waits Retry-After (capped at 10 s) and resends the same request", async () => {
+  const calls = [];
+  const busy = { error: { code: "filing_in_progress" } };
+  const fetch = mockFetch([[409, busy, { "retry-after": "5" }], [409, busy, { "retry-after": "60" }], [200, { device_token: "mdt1.next" }]], calls);
+  const m = new Matheel(null, undefined, { fetch });
+  const waits = [];
+  m.wait = async (ms) => { waits.push(ms); };
+  const store = memoryStore("mdt1.old");
+  await m.fileWithStore(store, { uuid: "u1" });
+  assert.deepEqual(waits, [5000, 10000]);
+  assert.deepEqual(calls.map((c) => c.body), Array(3).fill({ invoice: { uuid: "u1" }, device_token: "mdt1.old" }));
+  assert.deepEqual(store.writes, ["mdt1.next"]);
+});
+
+test("fileWithStore: in_progress is bounded and previous_filing_unknown is not retried", async () => {
+  const busy = [409, { error: { code: "filing_in_progress" } }, { "retry-after": "1" }];
+  const m = new Matheel(null, undefined, { fetch: mockFetch([busy, busy, busy, busy, busy], []) });
+  m.wait = async () => {};
+  await assert.rejects(m.fileWithStore(memoryStore("t"), {}, { retries: 2 }), (e) => e.code === "filing_in_progress" && e.retryAfter === 1);
+  const calls = [];
+  const prev = [409, { error: { code: "previous_filing_unknown", uuid: "earlier" } }];
+  await assert.rejects(new Matheel(null, undefined, { fetch: mockFetch([prev], calls) }).fileWithStore(memoryStore("t"), {}), (e) => {
+    assert.equal(classify(e), "attention");
+    assert.equal(e.body.error.uuid, "earlier");
+    return true;
+  });
+  assert.equal(calls.length, 1);
+});
+
+test("network failures become MatheelError status 0 network_error (mocked fetch and the real transport)", async () => {
+  for (const thrown of [new TypeError("fetch failed"), new DOMException("The operation timed out.", "TimeoutError")]) {
+    const fetch = async () => { throw thrown; };
+    const store = memoryStore("mdt1.old");
+    await assert.rejects(new Matheel(null, undefined, { fetch }).fileWithStore(store, {}), (e) => {
+      assert.ok(e instanceof MatheelError);
+      assert.equal(e.status, 0);
+      assert.equal(e.code, "network_error");
+      assert.equal(e.cause, thrown);
+      assert.equal(classify(e), "retry");
+      return true;
+    });
+    assert.deepEqual(store.writes, []);
+  }
+  // Nothing listens on port 1: the built-in node:https transport must fail the same way.
+  await assert.rejects(new Matheel(null, "https://127.0.0.1:1").fileInvoice({ invoice: {} }), { status: 0, code: "network_error" });
+});
+
+test("a 200 that is not the API's answer is invalid_response, never success", async () => {
+  const html = "<!DOCTYPE html><html><body>Login to Wi-Fi</body></html>";
+  for (const body of [html, { status: "reported" }, "null"]) {
+    const store = memoryStore("mdt1.old");
+    const m = new Matheel(null, undefined, { fetch: mockFetch([[200, body]], []) });
+    await assert.rejects(m.fileWithStore(store, {}), (e) => {
+      assert.ok(e instanceof MatheelError);
+      assert.equal(e.code, "invalid_response");
+      assert.equal(e.status, 502);
+      assert.equal(classify(e), "retry");
+      return true;
+    });
+    assert.deepEqual(store.writes, []);
+  }
+  // Without a device_token (keyless sandbox, own credentials) a JSON 200 with no token is fine.
+  const ok = await new Matheel(null, undefined, { fetch: mockFetch([[200, { status: "reported" }]], []) }).fileInvoice({ invoice: {} });
+  assert.equal(ok.status, "reported");
+});
+
+test("classify follows the API contract", () => {
+  const e = (status, error) => new MatheelError(status, { error });
+  const cases = [
+    [e(0, "network_error"), "retry"], [e(502, "invalid_response"), "retry"], [e(504, { code: "filing_outcome_unknown" }), "retry"],
+    [e(503, { code: "zatca_unavailable" }), "retry"], [e(429, "sandbox_rate_limited"), "retry"], [e(500, "boom"), "retry"],
+    [e(409, { code: "device_token_reused" }), "retry"], [e(409, { code: "filing_in_progress" }), "retry"],
+    [e(422, { code: "filing_failed" }), "retry"],
+    [new MatheelError(422, { status: "rejected", errors: [{ code: "BR-KSA-33" }] }), "permanent"],
+    [e(422, { code: "zatca_rejected" }), "permanent"], [e(422, { code: "invalid" }), "permanent"],
+    [e(422, { code: "missing_fields" }), "permanent"], [e(422, { code: "invalid_amount" }), "permanent"],
+    [e(422, { code: "validation_failed" }), "permanent"],
+    [e(401, "invalid_api_key"), "attention"], [e(401, { code: "invalid_csid" }), "attention"],
+    [e(402, "production_plan_required"), "attention"], [e(409, { code: "previous_filing_unknown" }), "attention"],
+    [new Error("store failed"), "attention"],
+  ];
+  for (const [error, expected] of cases) assert.equal(classify(error), expected, error.message);
 });

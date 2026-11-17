@@ -6,18 +6,46 @@ const https = require("node:https");
 
 const DEFAULT_BASE_URL = "https://matheel.app";
 
-/** An API answer other than 200: carries the HTTP status, the parsed body and the error code. */
+/** A failed call: an API answer other than 200 (HTTP status, parsed body, error code), or status 0 for a network failure. */
 class MatheelError extends Error {
-  /** Builds the error from the HTTP status and the parsed response body. */
-  constructor(status, body) {
+  /** Builds the error from the HTTP status, the parsed response body and the Retry-After header (seconds, or null). */
+  constructor(status, body, retryAfter = null) {
     const code = errorCode(status, body);
     super(`Matheel ${status}: ${code}`);
     this.name = "MatheelError";
     this.status = status;
     this.body = body;
     this.code = code;
+    this.retryAfter = retryAfter;
   }
 }
+
+// What the caller should do with an error, per the API contract (https://matheel.app/llms.txt).
+const RETRY_CODES = new Set([
+  "network_error", "invalid_response", "device_token_reused", "filing_in_progress", "filing_outcome_unknown",
+  "zatca_unavailable", "filing_failed", "billing_unavailable", "sandbox_rate_limited",
+]);
+const PERMANENT_CODES = new Set(["zatca_rejected", "invalid", "missing_fields", "invalid_amount", "validation_failed"]);
+
+/**
+ * "retry" (send the same request again later: same token, same invoice.uuid), "permanent" (fix the document) or
+ * "attention" (a person must act: key, plan, certificate, an earlier unanswered document, anything unknown).
+ */
+function classify(error) {
+  if (!(error instanceof MatheelError)) return "attention";
+  if (RETRY_CODES.has(error.code)) return "retry";
+  if (PERMANENT_CODES.has(error.code)) return "permanent";
+  if (error.status === 0 || error.status === 429 || error.status >= 500) return "retry";
+  return "attention";
+}
+
+/** The MatheelError for an answer that is not the API's JSON (an HTML page, a 200 with no device_token). */
+function invalidResponse(body) {
+  return new MatheelError(502, { error: "invalid_response", raw: body });
+}
+
+/** Waits `ms` milliseconds. */
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** The code of an error body: `error` (a string or `{code}`), else `zatca_rejected` when ZATCA's `errors` are present. */
 function errorCode(status, body) {
@@ -41,7 +69,7 @@ function httpsFetch(url, { method, headers, body, signal }) {
       res.on("data", (c) => chunks.push(c));
       res.on("end", () => {
         const text = Buffer.concat(chunks).toString("utf8");
-        resolve({ status: res.statusCode, text: async () => text });
+        resolve({ status: res.statusCode, headers: { get: (name) => res.headers[name.toLowerCase()] ?? null }, text: async () => text });
       });
       res.on("error", reject);
     });
@@ -60,50 +88,84 @@ class Matheel {
     this.timeoutMs = options.timeoutMs || 60000;
   }
 
-  /** POSTs JSON to an API path and returns the parsed body; throws MatheelError on any status but 200. */
+  /** POSTs JSON to an API path and returns the parsed body; throws MatheelError on any status but 200 (status 0 when the network failed). */
   async post(path, body) {
     const headers = { "Content-Type": "application/json", Accept: "application/json" };
     if (this.key) headers.Authorization = `Bearer ${this.key}`;
-    const res = await this.fetch(this.baseUrl + path, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(this.timeoutMs),
-    });
-    const text = await res.text();
+    let res, text;
+    try {
+      res = await this.fetch(this.baseUrl + path, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(this.timeoutMs),
+      });
+      text = await res.text();
+    } catch (e) {
+      // Timeouts, DNS, resets, TLS: the request may or may not have reached Matheel, so it is safe to send again.
+      const error = new MatheelError(0, { error: "network_error", message: String((e && e.message) || e) });
+      error.cause = e;
+      throw error;
+    }
     let parsed;
     try {
       parsed = text ? JSON.parse(text) : {};
     } catch {
       parsed = { error: "invalid_json", raw: text };
     }
-    if (res.status !== 200) throw new MatheelError(res.status, parsed);
+    if (res.status !== 200) {
+      const header = res.headers && res.headers.get ? res.headers.get("retry-after") : null;
+      const retryAfter = header == null || header === "" ? NaN : Number(header);
+      throw new MatheelError(res.status, parsed, retryAfter >= 0 ? retryAfter : null);
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || parsed.error === "invalid_json") throw invalidResponse(text);
     return parsed;
   }
 
   /** Files one invoice (POST /api/v1/invoices) and returns ZATCA's answer; extra fields (environment, seller, csid, mode) pass through. */
-  fileInvoice({ deviceToken, invoice, pdf, ...rest }) {
+  async fileInvoice({ deviceToken, invoice, pdf, ...rest }) {
     const body = { ...rest, invoice };
     if (deviceToken) body.device_token = deviceToken;
     if (pdf !== undefined) body.pdf = pdf;
-    return this.post("/api/v1/invoices", body);
+    const res = await this.post("/api/v1/invoices", body);
+    // A device filing always answers with the next token; without one the answer did not come from the API.
+    if (deviceToken && typeof res.device_token !== "string") throw invalidResponse(res);
+    return res;
   }
 
   /**
-   * Files with the device token held in `store`: writes the new token on 200, re-reads and retries on 409
-   * device_token_reused (up to `retries` times), leaves the token untouched on any other error (and throws).
+   * Files with the device token held in `store` and writes the next token on 200. Up to `retries` times it stores
+   * the latest token and resends on 409 device_token_reused, or waits Retry-After (max 10 s) on filing_in_progress.
+   * `uuid` is put into an invoice that has none: pass one per business document so a resend is never filed twice.
    */
-  async fileWithStore(store, invoice, { pdf, retries = 3, ...rest } = {}) {
+  async fileWithStore(store, invoice, { pdf, retries = 3, uuid, ...rest } = {}) {
+    if (uuid && invoice && !invoice.uuid) invoice = { ...invoice, uuid };
+    let deviceToken = await store.read();
     for (let attempt = 0; ; attempt++) {
-      const deviceToken = await store.read();
       try {
         const res = await this.fileInvoice({ ...rest, deviceToken, invoice, pdf });
         if (res.device_token) await store.write(res.device_token);
         return res;
       } catch (e) {
-        if (!(e instanceof MatheelError && e.status === 409 && e.code === "device_token_reused") || attempt >= retries) throw e;
+        if (!(e instanceof MatheelError && e.status === 409) || attempt >= retries) throw e;
+        const latest = e.body && e.body.error && e.body.error.latest_device_token;
+        if (e.code === "device_token_reused" && latest) {
+          await store.write(latest);
+          deviceToken = latest;
+        } else if (e.code === "device_token_reused") {
+          deviceToken = await store.read(); // no latest token in the answer: another writer may have stored it
+        } else if (e.code === "filing_in_progress") {
+          await this.wait(Math.min(e.retryAfter ?? 5, 10) * 1000);
+        } else {
+          throw e;
+        }
       }
     }
+  }
+
+  /** Sleeps between fileWithStore retries; replace it in tests. */
+  wait(ms) {
+    return delay(ms);
   }
 
   /** Registers a device with ZATCA (POST /api/v1/onboarding) and returns its `device_token`. */
@@ -190,4 +252,4 @@ function verifyTelr(postFields, secret) {
   return safeEqual(expected, String(fields.tran_check).trim().toLowerCase());
 }
 
-module.exports = { Matheel, MatheelError, decodeQr, verifyActivationCallback, verifyTelr };
+module.exports = { Matheel, MatheelError, classify, decodeQr, verifyActivationCallback, verifyTelr };
