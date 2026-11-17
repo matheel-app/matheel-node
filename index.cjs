@@ -2,6 +2,7 @@
 "use strict";
 
 const crypto = require("node:crypto");
+const https = require("node:https");
 
 const DEFAULT_BASE_URL = "https://matheel.app";
 
@@ -27,15 +28,36 @@ function errorCode(status, body) {
   return `http_${status}`;
 }
 
+// Some networks between a cloud host and Matheel's edge drop the large post-quantum TLS ClientHello that
+// OpenSSL 3.5 (Node 24+) sends by default (measured 2026-11-17: Node 24 fetch fails, the same call with a classic
+// key share succeeds). So the default transport is node:https with a classic key share; options.fetch overrides it.
+const CURVES = "X25519:P-256:P-384";
+
+/** A minimal fetch over node:https with a classic TLS key share: enough for the JSON POSTs this client makes. */
+function httpsFetch(url, { method, headers, body, signal }) {
+  return new Promise((resolve, reject) => {
+    const req = https.request(url, { method, headers, signal, ecdhCurve: CURVES }, (res) => {
+      const chunks = [];
+      res.on("data", (c) => chunks.push(c));
+      res.on("end", () => {
+        const text = Buffer.concat(chunks).toString("utf8");
+        resolve({ status: res.statusCode, text: async () => text });
+      });
+      res.on("error", reject);
+    });
+    req.on("error", reject);
+    req.end(body);
+  });
+}
+
 /** A client for the Matheel API; `key` is optional on the sandbox. */
 class Matheel {
-  /** Creates a client; `options.fetch` replaces the global fetch, `options.timeoutMs` bounds each call (default 60 s). */
+  /** Creates a client; `options.fetch` replaces the built-in node:https transport, `options.timeoutMs` bounds each call (default 60 s). */
   constructor(key, baseUrl = DEFAULT_BASE_URL, options = {}) {
     this.key = key || null;
     this.baseUrl = String(baseUrl || DEFAULT_BASE_URL).replace(/\/+$/, "");
-    this.fetch = options.fetch || globalThis.fetch;
+    this.fetch = options.fetch || httpsFetch;
     this.timeoutMs = options.timeoutMs || 60000;
-    if (typeof this.fetch !== "function") throw new Error("matheel: no fetch available (Node >= 18 required)");
   }
 
   /** POSTs JSON to an API path and returns the parsed body; throws MatheelError on any status but 200. */
